@@ -431,7 +431,7 @@ def get_agent_keyboard():
             ["📈 Моя статистика", "📋 Мой отчёт сегодня"],
         ],
         resize_keyboard=True,
-        persistent=True,
+        is_persistent=True,
     )
 
 
@@ -444,7 +444,7 @@ def get_admin_keyboard():
             ["✏️ Изменить имя агента"],
         ],
         resize_keyboard=True,
-        persistent=True,
+        is_persistent=True,
     )
 
 # ─── Registration handlers ─────────────────────────────────────────────────────
