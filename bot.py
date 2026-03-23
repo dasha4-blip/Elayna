@@ -545,7 +545,7 @@ def main():
             APPOINTMENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_appointments)],
             REGISTRATIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_registrations)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel), CommandHandler('report', report_start)]
     )
 
     app.add_handler(CommandHandler('start', start))
