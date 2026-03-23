@@ -8,7 +8,7 @@ import gspread
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from google.oauth2.service_account import Credentials
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -41,6 +41,8 @@ OBS_ADD_NAME = 6
 OBS_REMOVE_ID = 7
 FIX_ID = 8
 FIX_NAME = 9
+MANAGE_ACTION = 10
+MANAGE_ID = 11
 
 DB_PATH = "bot.db"
 
@@ -59,7 +61,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             full_name TEXT,
-            role TEXT
+            role TEXT,
+            status TEXT DEFAULT 'active'
         )
     """)
     c.execute("""
@@ -74,6 +77,11 @@ def init_db():
         )
     """)
     conn.commit()
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.close()
 
 
@@ -153,6 +161,22 @@ def remove_user_from_sheet(user_id):
                 return
     except Exception as e:
         logger.error(f"remove_user_from_sheet error: {e}")
+
+
+def set_agent_status(user_id, status):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_agent_status(user_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row["status"] if row and row["status"] else "active"
 
 
 def load_users_from_sheet():
@@ -429,6 +453,7 @@ def get_agent_keyboard():
         [
             ["📊 Сдать отчёт", "✏️ Изменить отчёт"],
             ["📈 Моя статистика", "📋 Мой отчёт сегодня"],
+            ["❌ Отмена"],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -442,6 +467,20 @@ def get_admin_keyboard():
             ["👥 Список команды", "❓ Кто не сдал"],
             ["➕ Добавить наблюдателя", "➖ Удалить наблюдателя"],
             ["✏️ Изменить имя агента"],
+            ["👤 Управление агентами"],
+            ["❌ Отмена"],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def get_observer_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["📋 Статистика за день", "📊 Статистика за неделю"],
+            ["❓ Кто не сдал?"],
+            ["❌ Отмена"],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -460,9 +499,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(user_id)
     if user:
-        await update.message.reply_text(
-            f"👋 Привет, {user['full_name']}!", reply_markup=get_agent_keyboard()
-        )
+        if user["role"] == "observer":
+            await update.message.reply_text(
+                f"👋 Привет, {user['full_name']}!",
+                reply_markup=get_observer_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"👋 Привет, {user['full_name']}!", reply_markup=get_agent_keyboard()
+            )
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -522,7 +567,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user = get_user(user_id)
         if user:
-            await update.message.reply_text("Отменено.", reply_markup=get_agent_keyboard())
+            if user["role"] == "observer":
+                await update.message.reply_text("Отменено.", reply_markup=get_observer_keyboard())
+            else:
+                await update.message.reply_text("Отменено.", reply_markup=get_agent_keyboard())
         else:
             await update.message.reply_text("Отменено.")
     return ConversationHandler.END
@@ -533,6 +581,10 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_registered(user_id):
         await update.message.reply_text("Сначала зарегистрируйся через /start")
+        return ConversationHandler.END
+
+    if get_agent_status(user_id) == 'blocked':
+        await update.message.reply_text("⛔ Вы заблокированы и не можете сдавать отчёты.")
         return ConversationHandler.END
 
     if get_today_report(user_id):
@@ -554,6 +606,10 @@ async def report_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_registered(user_id):
         await update.message.reply_text("Сначала зарегистрируйся через /start")
+        return ConversationHandler.END
+
+    if get_agent_status(user_id) == 'blocked':
+        await update.message.reply_text("⛔ Вы заблокированы и не можете сдавать отчёты.")
         return ConversationHandler.END
 
     context.user_data["edit_mode"] = True
@@ -889,6 +945,113 @@ async def admin_fix_name_new(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     return ConversationHandler.END
 
+
+# ─── Manage agents handlers ─────────────────────────────────────────────
+
+async def admin_manage_agents_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    keyboard = ReplyKeyboardMarkup(
+        [["🗑 Удалить агента", "🚫 Заблокировать агента"],
+         ["✅ Разблокировать агента", "◀️ Назад"]],
+        resize_keyboard=True
+    )
+    await update.message.reply_text("Выбери действие:", reply_markup=keyboard)
+    return MANAGE_ACTION
+
+
+async def admin_manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text == "◀️ Назад":
+        await update.message.reply_text("Главное меню", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+    action_map = {
+        "🗑 Удалить агента": "delete",
+        "🚫 Заблокировать агента": "block",
+        "✅ Разблокировать агента": "unblock"
+    }
+    if text not in action_map:
+        await update.message.reply_text("Выбери действие из меню:")
+        return MANAGE_ACTION
+    context.user_data["manage_action"] = action_map[text]
+    prompts = {
+        "delete": "Введи Telegram ID агента для удаления:",
+        "block": "Введи Telegram ID агента для блокировки:",
+        "unblock": "Введи Telegram ID агента для разблокировки:"
+    }
+    await update.message.reply_text(prompts[action_map[text]], reply_markup=ReplyKeyboardRemove())
+    return MANAGE_ID
+
+
+async def admin_manage_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    try:
+        uid = int(text)
+    except ValueError:
+        await update.message.reply_text("Введи корректный ID (только цифры):")
+        return MANAGE_ID
+
+    user = get_user(uid)
+    if not user or user["role"] != "agent":
+        await update.message.reply_text(f"Агент с ID {uid} не найден.", reply_markup=get_admin_keyboard())
+        return ConversationHandler.END
+
+    action = context.user_data.get("manage_action")
+    name = user["full_name"]
+
+    if action == "delete":
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+        conn.commit()
+        conn.close()
+        try:
+            remove_user_from_sheet(uid)
+        except Exception as e:
+            logger.error(f"remove agent from sheet error: {e}")
+        msg = f"✅ Агент {name} (ID: {uid}) удалён."
+    elif action == "block":
+        set_agent_status(uid, "blocked")
+        msg = f"🚫 Агент {name} (ID: {uid}) заблокирован."
+    elif action == "unblock":
+        set_agent_status(uid, "active")
+        msg = f"✅ Агент {name} (ID: {uid}) разблокирован."
+    else:
+        msg = "Неизвестное действие."
+
+    context.user_data.clear()
+    await update.message.reply_text(msg, reply_markup=get_admin_keyboard())
+    return ConversationHandler.END
+
+# ─── Observer handlers ─────────────────────────────────────────────────────────
+
+async def observer_stats_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    if not user or user["role"] != "observer":
+        return
+    await update.message.reply_text(build_summary(), reply_markup=get_observer_keyboard())
+
+
+async def observer_stats_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    if not user or user["role"] != "observer":
+        return
+    await update.message.reply_text(build_week_summary(), reply_markup=get_observer_keyboard())
+
+
+async def observer_who_didnt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = get_user(update.effective_user.id)
+    if not user or user["role"] != "observer":
+        return
+    not_submitted = get_agents_without_report_today()
+    if not not_submitted:
+        text = "✅ Все агенты сдали отчёт сегодня!"
+    else:
+        lines = ["❓ Не сдали отчёт сегодня:\n"]
+        for row in not_submitted:
+            lines.append(f"  ❌ {row['full_name']}")
+        text = "\n".join(lines)
+    await update.message.reply_text(text, reply_markup=get_observer_keyboard())
+
 # ─── Admin commands (/summary, /week, /agents) ─────────────────────────────────
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1028,13 +1191,14 @@ def main():
             REG_LAST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_last_name)],
             REG_FIRST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_first_name)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
         allow_reentry=True,
     )
 
     # ── Report ConversationHandler ──
-    report_button_filter = filters.Regex("^📊 Сдать отчёт$") | filters.Regex("^✏️ Изменить отчёт$")
-
     report_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex("^📊 Сдать отчёт$"), report_start),
@@ -1057,7 +1221,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, report_registrations),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
         allow_reentry=True,
     )
 
@@ -1075,21 +1242,45 @@ def main():
             FIX_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_fix_name_id)],
             FIX_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_fix_name_new)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
+        allow_reentry=True,
+    )
+
+    # ── Manage agents ConversationHandler ──
+    manage_conv_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^👤 Управление агентами$"), admin_manage_agents_start),
+        ],
+        states={
+            MANAGE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manage_action)],
+            MANAGE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manage_id)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
         allow_reentry=True,
     )
 
     application.add_handler(registration_handler)
     application.add_handler(report_handler)
     application.add_handler(admin_conv_handler)
+    application.add_handler(manage_conv_handler)
 
     # ── Standalone message handlers ──
+    application.add_handler(MessageHandler(filters.Regex("^❌ Отмена$"), cancel))
     application.add_handler(MessageHandler(filters.Regex("^📈 Моя статистика$"), my_stats))
     application.add_handler(MessageHandler(filters.Regex("^📋 Мой отчёт сегодня$"), my_today_report))
     application.add_handler(MessageHandler(filters.Regex("^📋 Сводка сегодня$"), admin_summary_today))
     application.add_handler(MessageHandler(filters.Regex("^📊 Статистика за неделю$"), admin_week_stats))
     application.add_handler(MessageHandler(filters.Regex("^👥 Список команды$"), admin_agents_list))
     application.add_handler(MessageHandler(filters.Regex("^❓ Кто не сдал$"), admin_who_didnt_submit))
+    application.add_handler(MessageHandler(filters.Regex("^📋 Статистика за день$"), observer_stats_today))
+    application.add_handler(MessageHandler(filters.Regex("^📊 Статистика за неделю$"), observer_stats_week))
+    application.add_handler(MessageHandler(filters.Regex("^❓ Кто не сдал\\?$"), observer_who_didnt))
 
     # ── Admin slash commands ──
     application.add_handler(CommandHandler("summary", cmd_summary))
@@ -1127,6 +1318,11 @@ def main():
 
         scheduler.start()
         logger.info("Scheduler started with all jobs")
+
+        await app.bot.set_my_commands([
+            BotCommand("start", "Главное меню"),
+            BotCommand("cancel", "Отменить действие"),
+        ])
 
     async def post_shutdown(app: Application):
         if scheduler.running:
