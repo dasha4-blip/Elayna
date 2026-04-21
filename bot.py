@@ -82,7 +82,7 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'")
         conn.commit()
     except sqlite3.OperationalError:
-        pass  # column already exists
+        pass
     conn.close()
 
 
@@ -130,7 +130,7 @@ def get_or_create_month_sheet(gc, for_date=None):
         ws = spreadsheet.worksheet(sheet_title)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=sheet_title, rows=1000, cols=10)
-        ws.append_row(["ID", "Имя агента", "Касания", "Назначения", "Регистрации"])
+        ws.update("A1:E1", [["ID", "Имя агента", "Касания", "Назначения", "Регистрации"]])
     return ws
 
 
@@ -212,58 +212,110 @@ def load_users_from_sheet():
         logger.error(f"load_users_from_sheet error: {e}")
 
 
-def update_google_sheet(for_date=None):
+def update_agent_month_in_sheet(user_id, for_date=None):
+    """Пересчитывает месячный итог одного агента из SQLite и записывает в таблицу."""
     try:
         if for_date is None:
             for_date = moscow_today()
-        date_str = for_date.isoformat()
+        month_start = for_date.replace(day=1)
+
         conn = get_db_connection()
         c = conn.cursor()
         c.execute(
-            "SELECT r.user_id, u.full_name, r.touches, r.appointments, r.registrations "
-            "FROM reports r JOIN users u ON r.user_id = u.user_id "
-            "WHERE r.report_date = ? AND u.role = 'agent'",
-            (date_str,),
+            "SELECT u.full_name, COALESCE(SUM(r.touches),0), "
+            "COALESCE(SUM(r.appointments),0), COALESCE(SUM(r.registrations),0) "
+            "FROM users u LEFT JOIN reports r ON u.user_id = r.user_id "
+            "AND r.report_date >= ? AND r.report_date <= ? "
+            "WHERE u.user_id = ? AND u.role = 'agent'",
+            (month_start.isoformat(), for_date.isoformat(), user_id),
+        )
+        row = c.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            return
+
+        full_name = row[0]
+        touches, appointments, registrations = row[1], row[2], row[3]
+        uid_str = str(user_id)
+
+        gc = get_sheet_client()
+        ws = get_or_create_month_sheet(gc, for_date=for_date)
+        all_values = ws.get_all_values()
+
+        id_to_row_idx = {}
+        for i, r in enumerate(all_values):
+            if i == 0:
+                continue
+            if r and r[0]:
+                id_to_row_idx[str(r[0])] = i + 1
+
+        if uid_str in id_to_row_idx:
+            row_idx = id_to_row_idx[uid_str]
+            ws.update(
+                f"A{row_idx}:E{row_idx}",
+                [[uid_str, full_name, touches, appointments, registrations]],
+            )
+        else:
+            ws.append_row([uid_str, full_name, touches, appointments, registrations])
+
+    except Exception as e:
+        logger.error(f"update_agent_month_in_sheet error for {user_id}: {e}")
+
+
+def update_google_sheet(for_date=None):
+    """Пересчитывает месячные итоги всех агентов из SQLite и записывает в таблицу."""
+    try:
+        if for_date is None:
+            for_date = moscow_today()
+        month_start = for_date.replace(day=1)
+
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute(
+            "SELECT u.user_id, u.full_name, "
+            "COALESCE(SUM(r.touches),0), COALESCE(SUM(r.appointments),0), COALESCE(SUM(r.registrations),0) "
+            "FROM users u LEFT JOIN reports r ON u.user_id = r.user_id "
+            "AND r.report_date >= ? AND r.report_date <= ? "
+            "WHERE u.role = 'agent' "
+            "GROUP BY u.user_id, u.full_name",
+            (month_start.isoformat(), for_date.isoformat()),
         )
         rows = c.fetchall()
         conn.close()
 
         if not rows:
-            logger.info("No reports for the specified date, skipping sheet update")
+            logger.info("No agents found, skipping sheet update")
             return
 
         gc = get_sheet_client()
         ws = get_or_create_month_sheet(gc, for_date=for_date)
         all_values = ws.get_all_values()
 
-        # Build index: user_id (col A) -> row index (1-based)
         id_to_row_idx = {}
         for i, row in enumerate(all_values):
             if i == 0:
                 continue
             if row and row[0]:
-                id_to_row_idx[str(row[0])] = i + 1  # 1-based sheet row
+                id_to_row_idx[str(row[0])] = i + 1
 
-        for user_id, full_name, touches, appointments, registrations in rows:
+        for row in rows:
+            user_id, full_name, touches, appointments, registrations = (
+                row[0], row[1], row[2], row[3], row[4]
+            )
+            uid_str = str(user_id)
             try:
-                uid_str = str(user_id)
                 if uid_str in id_to_row_idx:
                     row_idx = id_to_row_idx[uid_str]
-                    existing = all_values[row_idx - 1]
-                    try:
-                        ex_t = int(existing[2]) if len(existing) > 2 and existing[2] else 0
-                        ex_a = int(existing[3]) if len(existing) > 3 and existing[3] else 0
-                        ex_r = int(existing[4]) if len(existing) > 4 and existing[4] else 0
-                    except (ValueError, IndexError):
-                        ex_t = ex_a = ex_r = 0
                     ws.update(
                         f"A{row_idx}:E{row_idx}",
-                        [[uid_str, full_name, ex_t + touches, ex_a + appointments, ex_r + registrations]],
+                        [[uid_str, full_name, touches, appointments, registrations]],
                     )
                 else:
                     ws.append_row([uid_str, full_name, touches, appointments, registrations])
             except Exception as e:
                 logger.error(f"update_google_sheet agent {user_id} error: {e}")
+
     except Exception as e:
         logger.error(f"update_google_sheet error: {e}")
 
@@ -382,7 +434,7 @@ def get_agent_best_appointments(user_id):
     c = conn.cursor()
     c.execute(
         "SELECT COALESCE(MAX(appointments), 0) FROM reports WHERE user_id = ? AND report_date != ?",
-        (user_id, today_str)
+        (user_id, today_str),
     )
     result = c.fetchone()
     conn.close()
@@ -421,7 +473,6 @@ def build_summary(for_date=None):
         else:
             not_submitted_names.append(name)
 
-    # Sort submitted by appointments descending
     submitted.sort(key=lambda x: x[2], reverse=True)
 
     counter = 1
@@ -474,7 +525,6 @@ def build_week_summary():
     lines = [f"📊 Статистика за неделю\n({monday.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')})\n"]
     total_t = total_a = total_r = 0
 
-    # Sort by appointments descending
     sorted_rows = sorted(rows, key=lambda x: x[3], reverse=True)
 
     counter = 1
@@ -559,7 +609,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user["role"] == "observer":
             await update.message.reply_text(
                 f"👋 Привет, {user['full_name']}!",
-                reply_markup=get_observer_keyboard()
+                reply_markup=get_observer_keyboard(),
             )
         else:
             await update.message.reply_text(
@@ -640,7 +690,7 @@ async def report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала зарегистрируйся через /start")
         return ConversationHandler.END
 
-    if get_agent_status(user_id) == 'blocked':
+    if get_agent_status(user_id) == "blocked":
         await update.message.reply_text("⛔ Вы заблокированы и не можете сдавать отчёты.")
         return ConversationHandler.END
 
@@ -665,7 +715,7 @@ async def report_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала зарегистрируйся через /start")
         return ConversationHandler.END
 
-    if get_agent_status(user_id) == 'blocked':
+    if get_agent_status(user_id) == "blocked":
         await update.message.reply_text("⛔ Вы заблокированы и не можете сдавать отчёты.")
         return ConversationHandler.END
 
@@ -720,11 +770,16 @@ async def report_registrations(update: Update, context: ContextTypes.DEFAULT_TYP
     appointments = context.user_data.get("appointments", 0)
     registrations = val
 
-    # Check personal record BEFORE saving (get best from previous days)
     prev_best = get_agent_best_appointments(user_id)
 
     save_report(user_id, touches, appointments, registrations)
     context.user_data.clear()
+
+    # Сразу синхронизируем с Google Sheets
+    try:
+        update_agent_month_in_sheet(user_id)
+    except Exception as e:
+        logger.error(f"update_agent_month_in_sheet on report error: {e}")
 
     user = get_user(user_id)
     name = user["full_name"] if user else "Агент"
@@ -739,7 +794,6 @@ async def report_registrations(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Регистрации: {registrations}"
     )
 
-    # Personal record notification
     if appointments > prev_best:
         msg += "\n\n🏆 Новый личный рекорд по назначениям!"
 
@@ -873,7 +927,6 @@ async def admin_top_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month_name = MONTH_NAMES_RU[today.month]
     lines = [f"🏆 Топ за {month_name} {today.year}\n"]
 
-    # Sort by appointments descending
     sorted_rows = sorted(rows, key=lambda x: x[3], reverse=True)
 
     total_t = total_a = total_r = 0
@@ -1067,15 +1120,17 @@ async def admin_fix_name_new(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-# ─── Manage agents handlers ─────────────────────────────────────────────
+# ─── Manage agents handlers ────────────────────────────────────────────────────
 
 async def admin_manage_agents_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     keyboard = ReplyKeyboardMarkup(
-        [["🗑 Удалить агента", "🚫 Заблокировать агента"],
-         ["✅ Разблокировать агента", "◀️ Назад"]],
-        resize_keyboard=True
+        [
+            ["🗑 Удалить агента", "🚫 Заблокировать агента"],
+            ["✅ Разблокировать агента", "◀️ Назад"],
+        ],
+        resize_keyboard=True,
     )
     await update.message.reply_text("Выбери действие:", reply_markup=keyboard)
     return MANAGE_ACTION
@@ -1089,7 +1144,7 @@ async def admin_manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     action_map = {
         "🗑 Удалить агента": "delete",
         "🚫 Заблокировать агента": "block",
-        "✅ Разблокировать агента": "unblock"
+        "✅ Разблокировать агента": "unblock",
     }
     if text not in action_map:
         await update.message.reply_text("Выбери действие из меню:")
@@ -1098,9 +1153,11 @@ async def admin_manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     prompts = {
         "delete": "Введи Telegram ID агента для удаления:",
         "block": "Введи Telegram ID агента для блокировки:",
-        "unblock": "Введи Telegram ID агента для разблокировки:"
+        "unblock": "Введи Telegram ID агента для разблокировки:",
     }
-    await update.message.reply_text(prompts[action_map[text]], reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        prompts[action_map[text]], reply_markup=ReplyKeyboardRemove()
+    )
     return MANAGE_ID
 
 
@@ -1114,14 +1171,15 @@ async def admin_manage_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = get_user(uid)
     if not user or user["role"] != "agent":
-        await update.message.reply_text(f"Агент с ID {uid} не найден.", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(
+            f"Агент с ID {uid} не найден.", reply_markup=get_admin_keyboard()
+        )
         return ConversationHandler.END
 
     action = context.user_data.get("manage_action")
     name = user["full_name"]
 
     if action == "delete":
-        # Save for confirmation instead of deleting immediately
         context.user_data["delete_uid"] = uid
         context.user_data["delete_name"] = name
         await update.message.reply_text(
@@ -1237,7 +1295,6 @@ async def _send_reminder_to_unsent(bot, message: str):
 
 
 def make_scheduler_jobs(bot):
-    """Return all scheduler job coroutine factories bound to the given bot."""
 
     async def job_reminder_23():
         try:
@@ -1255,7 +1312,6 @@ def make_scheduler_jobs(bot):
         try:
             agents_without = get_agents_without_report_today()
 
-            # Send reminder to agents who haven't submitted
             for row in agents_without:
                 try:
                     await bot.send_message(
@@ -1265,7 +1321,6 @@ def make_scheduler_jobs(bot):
                 except Exception as e:
                     logger.error(f"job_reminder_2355 agent {row['user_id']} error: {e}")
 
-            # Notify admin and observers about who hasn't submitted
             if agents_without:
                 lines = ["🚨 Ещё не сдали отчёт (23:55):"]
                 for row in agents_without:
@@ -1298,6 +1353,7 @@ def make_scheduler_jobs(bot):
                     await bot.send_message(chat_id=obs["user_id"], text=text)
                 except Exception as e:
                     logger.error(f"job_daily_summary observer {obs['user_id']} error: {e}")
+            # Полная синхронизация всех агентов с таблицей в полночь
             update_google_sheet(for_date=yesterday)
         except Exception as e:
             logger.error(f"job_daily_summary error: {e}")
@@ -1306,20 +1362,55 @@ def make_scheduler_jobs(bot):
         try:
             today = moscow_today()
             monday = today - timedelta(days=today.weekday())
-            for agent in get_all_agents():
-                try:
-                    w_t, w_a, w_r = get_agent_week_stats(agent["user_id"])
-                    text = (
-                        f"📊 Твоя статистика за неделю\n"
-                        f"({monday.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')})\n\n"
-                        f"Касания: {w_t}\n"
-                        f"Назначения: {w_a}\n"
-                        f"Регистрации: {w_r}"
-                    )
-                    await bot.send_message(chat_id=agent["user_id"], text=text)
-                except Exception as e:
-                    logger.error(f"job_weekly_stats agent {agent['user_id']} error: {e}")
 
+            agents = get_all_agents()
+            agent_stats = []
+            for agent in agents:
+                w_t, w_a, w_r = get_agent_week_stats(agent["user_id"])
+                agent_stats.append({
+                    "user_id": agent["user_id"],
+                    "full_name": agent["full_name"],
+                    "touches": w_t,
+                    "appointments": w_a,
+                    "registrations": w_r,
+                })
+
+            # Сортировка: по назначениям, при равных — по касаниям
+            agent_stats.sort(
+                key=lambda x: (x["appointments"], x["touches"]), reverse=True
+            )
+
+            # Строим топ
+            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+            top_lines = [
+                f"🏆 Топ команды за неделю\n"
+                f"({monday.strftime('%d.%m')} — {today.strftime('%d.%m.%Y')})\n"
+            ]
+            for i, a in enumerate(agent_stats, start=1):
+                icon = medals.get(i, f"{i}.")
+                top_lines.append(
+                    f"{icon} {a['full_name']} — "
+                    f"{a['appointments']} назначений, {a['touches']} касаний"
+                )
+
+            top_text = "\n".join(top_lines)
+
+            # Каждому агенту — топ + его личная статистика
+            for a in agent_stats:
+                personal = (
+                    f"\n\n📊 Твоя статистика:\n"
+                    f"Касания: {a['touches']}\n"
+                    f"Назначения: {a['appointments']}\n"
+                    f"Регистрации: {a['registrations']}"
+                )
+                try:
+                    await bot.send_message(
+                        chat_id=a["user_id"], text=top_text + personal
+                    )
+                except Exception as e:
+                    logger.error(f"job_weekly_stats agent {a['user_id']} error: {e}")
+
+            # Админу и наблюдателям — полная сводка
             week_text = build_week_summary()
             await bot.send_message(chat_id=ADMIN_ID, text=week_text)
             for obs in get_all_observers():
@@ -1327,6 +1418,7 @@ def make_scheduler_jobs(bot):
                     await bot.send_message(chat_id=obs["user_id"], text=week_text)
                 except Exception as e:
                     logger.error(f"job_weekly_stats observer {obs['user_id']} error: {e}")
+
         except Exception as e:
             logger.error(f"job_weekly_stats error: {e}")
 
@@ -1426,7 +1518,9 @@ def main():
     # ── Manage agents ConversationHandler ──
     manage_conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^👤 Управление агентами$"), admin_manage_agents_start),
+            MessageHandler(
+                filters.Regex("^👤 Управление агентами$"), admin_manage_agents_start
+            ),
         ],
         states={
             MANAGE_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manage_action)],
